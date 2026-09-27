@@ -231,14 +231,13 @@ input.pinput{width:100%;background:var(--surface2);border:1px solid var(--border
         </div>
         <div style="display:flex;gap:5px;margin-bottom:6px">
           <button class="btn btn-sm btn-secondary" style="flex:1" onclick="setTool('wand')">🪄 Magic Wand</button>
-          <button class="btn btn-sm btn-secondary" onclick="restoreBackground()">↩ Restore</button>
+          <button class="btn btn-sm btn-secondary" onclick="restoreBackground()">↩ Reset All</button>
         </div>
-        <div class="srow">
-          <label>Smooth</label>
-          <input type="range" min="0" max="5" value="1" id="wandSmooth" oninput="document.getElementById('v-sm').textContent=this.value">
-          <span class="sv" id="v-sm">1</span>
+        <div style="font-size:10px;color:var(--text3);line-height:1.5">
+          Click to remove a background area, click again on another spot to remove more.<br>
+          Hold <b>Alt</b> (or <b>Ctrl</b>) and click to bring back an area you removed by mistake.<br>
+          Edges are auto-feathered to avoid a halo — raise Tolerance if bits of background remain, lower it if the subject gets eaten into.
         </div>
-        <div style="font-size:10px;color:var(--text3)">Click multiple areas to remove more background</div>
       </div>
 
       <div class="psec">
@@ -566,85 +565,118 @@ function resetSliders() {
 }
 
 // ===== MAGIC WAND BG REMOVAL =====
-// Flood-fill based: samples clicked pixel color, removes all connected similar-color pixels
-function magicWandRemove(clickX, clickY) {
+// Flood-fill based: samples clicked pixel color, removes all connected similar-color pixels.
+// mode: 'add' (default, plain click) extends the removed area; 'restore' (alt/ctrl-click) brings pixels back.
+// Feathers the boundary with an alpha ramp + color defringing instead of a hard cutoff, so edges
+// don't come out jagged or keep a halo of the old background color once composited onto a new one.
+function magicWandRemove(clickX, clickY, mode) {
   if (!canvas.width) return;
+  mode = mode || 'add';
   saveHistory();
   const tolerance = +document.getElementById('wandTolerance').value;
-  const smooth = +document.getElementById('wandSmooth').value;
   const w = canvas.width, h = canvas.height;
-  const imageData = ctx.getImageData(0, 0, w, h);
-  const data = imageData.data;
 
-  // Scale click coords from display to canvas
+  // Work from the last committed state so repeated clicks (add/restore) stack correctly.
+  const baseData = hasBgRemoved ? bgRemovedData : ctx.getImageData(0, 0, w, h);
+  const imageData = new ImageData(new Uint8ClampedArray(baseData.data), w, h);
+  const data = imageData.data;
+  // originalData still has full, untouched RGBA — used as the color/alpha source when restoring.
+  const orig = originalData ? originalData.data : data;
+
   const rect = canvas.getBoundingClientRect();
   const scaleX = w / canvas.offsetWidth;
   const scaleY = h / canvas.offsetHeight;
   const px = Math.round(clickX * scaleX);
   const py = Math.round(clickY * scaleY);
-
   if (px < 0 || px >= w || py < 0 || py >= h) return;
 
   const idx = (py * w + px) * 4;
-  const targetR = data[idx], targetG = data[idx+1], targetB = data[idx+2];
+  // Sample the click color from the ORIGINAL image, not the (possibly already-transparent) working
+  // copy, so clicking near an already-removed edge still picks up the intended background color.
+  const sampleData = mode === 'restore' ? data : orig;
+  const targetR = sampleData[idx], targetG = sampleData[idx+1], targetB = sampleData[idx+2];
+  const thresh = tolerance * 3;
+  const featherBand = Math.max(thresh * 0.5, 18);
 
-  function colorDiff(i) {
-    return Math.abs(data[i] - targetR) + Math.abs(data[i+1] - targetG) + Math.abs(data[i+2] - targetB);
+  function colorDiff(i, src) {
+    return Math.abs(src[i]-targetR) + Math.abs(src[i+1]-targetG) + Math.abs(src[i+2]-targetB);
   }
 
-  // BFS flood fill
-  const visited = new Uint8Array(w * h);
-  const queue = [px + py * w];
-  visited[px + py * w] = 1;
-  const toRemove = [];
+  // Fast BFS: typed-array queue with a head pointer instead of Array.shift() (O(1) vs O(n) per pop),
+  // and 8-connectivity so it doesn't leak through diagonal gaps or miss diagonally-connected regions.
+  const total = w * h;
+  const visited = new Uint8Array(total);
+  const queueArr = new Int32Array(total);
+  let qHead = 0, qTail = 0;
+  const startPos = px + py * w;
+  queueArr[qTail++] = startPos;
+  visited[startPos] = 1;
+  const inMask = new Uint8Array(total);
+  const scanSrc = mode === 'restore' ? data : orig; // restore mode floods over the ORIGINAL colors
 
-  while (queue.length > 0) {
-    const pos = queue.shift();
-    const cx = pos % w, cy = Math.floor(pos / w);
+  while (qHead < qTail) {
+    const pos = queueArr[qHead++];
+    const cx = pos % w, cy = (pos / w) | 0;
     const i = pos * 4;
-    if (colorDiff(i) <= tolerance * 3) {
-      toRemove.push(pos);
-      const neighbors = [cx-1+cy*w, cx+1+cy*w, cx+(cy-1)*w, cx+(cy+1)*w];
-      neighbors.forEach(n => {
-        if (n >= 0 && n < w * h && !visited[n]) {
-          const nx = n % w, ny = Math.floor(n / w);
-          if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
-            visited[n] = 1;
-            queue.push(n);
-          }
-        }
-      });
+    if (colorDiff(i, scanSrc) <= thresh) {
+      inMask[pos] = 1;
+      const hasL = cx > 0, hasR = cx < w - 1, hasU = cy > 0, hasD = cy < h - 1;
+      if (hasL && !visited[pos-1]) { visited[pos-1]=1; queueArr[qTail++]=pos-1; }
+      if (hasR && !visited[pos+1]) { visited[pos+1]=1; queueArr[qTail++]=pos+1; }
+      if (hasU && !visited[pos-w]) { visited[pos-w]=1; queueArr[qTail++]=pos-w; }
+      if (hasD && !visited[pos+w]) { visited[pos+w]=1; queueArr[qTail++]=pos+w; }
+      if (hasL&&hasU && !visited[pos-w-1]) { visited[pos-w-1]=1; queueArr[qTail++]=pos-w-1; }
+      if (hasR&&hasU && !visited[pos-w+1]) { visited[pos-w+1]=1; queueArr[qTail++]=pos-w+1; }
+      if (hasL&&hasD && !visited[pos+w-1]) { visited[pos+w-1]=1; queueArr[qTail++]=pos+w-1; }
+      if (hasR&&hasD && !visited[pos+w+1]) { visited[pos+w+1]=1; queueArr[qTail++]=pos+w+1; }
     }
   }
 
-  // Remove pixels (set alpha to 0)
-  toRemove.forEach(pos => {
-    const i = pos * 4;
-    data[i+3] = 0;
-  });
-
-  // Optional edge smoothing
-  if (smooth > 0) {
-    toRemove.forEach(pos => {
-      const cx = pos % w, cy = Math.floor(pos / w);
-      for (let dy = -smooth; dy <= smooth; dy++) {
-        for (let dx = -smooth; dx <= smooth; dx++) {
-          const nx = cx + dx, ny = cy + dy;
-          if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
-            const ni = (ny * w + nx) * 4;
-            if (data[ni+3] > 0) {
-              const dist = Math.sqrt(dx*dx + dy*dy);
-              const fade = Math.max(0, 1 - dist / (smooth + 1));
-              data[ni+3] = Math.round(data[ni+3] * (1 - fade * 0.7));
-            }
-          }
+  if (mode === 'restore') {
+    for (let p = 0; p < total; p++) {
+      if (inMask[p]) {
+        const i = p * 4;
+        data[i] = orig[i]; data[i+1] = orig[i+1]; data[i+2] = orig[i+2]; data[i+3] = orig[i+3];
+      }
+    }
+  } else {
+    for (let p = 0; p < total; p++) {
+      if (inMask[p]) data[p*4+3] = 0;
+    }
+    // Feather the boundary: pixels touching the removed mask get a partial alpha based on how
+    // background-like their color actually is, plus defringing (unmix the background color back
+    // out of the surviving RGB) so no background halo is left once placed on a new background.
+    for (let p = 0; p < total; p++) {
+      if (inMask[p]) continue;
+      const cx = p % w, cy = (p / w) | 0;
+      let adjacent = false;
+      for (let dy = -1; dy <= 1 && !adjacent; dy++) {
+        for (let dx = -1; dx <= 1 && !adjacent; dx++) {
+          if (!dx && !dy) continue;
+          const nx = cx+dx, ny = cy+dy;
+          if (nx>=0 && nx<w && ny>=0 && ny<h && inMask[ny*w+nx]) adjacent = true;
         }
       }
-    });
+      if (!adjacent) continue;
+      const i = p * 4;
+      const d = colorDiff(i, orig);
+      if (d < thresh + featherBand) {
+        const t = Math.max(0, Math.min(1, (d - thresh) / featherBand)); // 0=bg-like -> 1=subject-like
+        const newAlpha = Math.round(255 * t);
+        if (newAlpha < data[i+3]) {
+          if (t > 0.04) {
+            data[i]   = Math.max(0, Math.min(255, (orig[i]   - (1-t)*targetR) / t));
+            data[i+1] = Math.max(0, Math.min(255, (orig[i+1] - (1-t)*targetG) / t));
+            data[i+2] = Math.max(0, Math.min(255, (orig[i+2] - (1-t)*targetB) / t));
+          }
+          data[i+3] = newAlpha;
+        }
+      }
+    }
   }
 
   ctx.putImageData(imageData, 0, 0);
-  bgRemovedData = ctx.getImageData(0, 0, w, h);
+  bgRemovedData = imageData;
   hasBgRemoved = true;
 }
 
@@ -839,7 +871,8 @@ function setTool(t) {
 drawCanvas.addEventListener('mousedown', e => {
   if (currentTool === 'wand') {
     const rect = drawCanvas.getBoundingClientRect();
-    magicWandRemove(e.clientX - rect.left, e.clientY - rect.top);
+    const mode = (e.altKey || e.ctrlKey) ? 'restore' : 'add';
+    magicWandRemove(e.clientX - rect.left, e.clientY - rect.top, mode);
     return;
   }
   if (currentTool === 'text') { placeTextAt(e); return; }
