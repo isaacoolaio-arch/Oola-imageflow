@@ -31,7 +31,7 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSy
 /* ===== BUTTONS ===== */
 .btn{padding:7px 14px;border-radius:7px;border:none;cursor:pointer;font-size:12px;font-weight:500;transition:all 0.15s}
 .btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{background:#6b5ce7}
-.btn-secondary{background:var(--surface3);color:var(--text);border:1px solid var(--border)}.btn-secondary:hover{background:var(--surface2)}
+.btn-secondary{background:var(--surface3);color:var(--text);border:1px solid var(--border)}.btn-secondary:hover{background:var(--surface2)}.btn-secondary.active{border-color:var(--accent);color:var(--accent2);background:rgba(124,106,247,0.08)}
 .btn-success{background:rgba(34,197,94,0.15);color:var(--success);border:1px solid rgba(34,197,94,0.3)}
 .btn-sm{padding:4px 10px;font-size:11px;border-radius:5px}
 
@@ -204,6 +204,7 @@ input.pinput{width:100%;background:var(--surface2);border:1px solid var(--border
       <div class="editor-bar">
         <button class="tbtn active" id="tool-select" onclick="setTool('select')" title="Select">↖</button>
         <button class="tbtn" id="tool-wand" onclick="setTool('wand')" title="Magic Wand BG Remove">🪄</button>
+        <button class="tbtn" id="tool-brush" onclick="setTool('brush')" title="Brush erase/restore — for spots the wand can't handle">🖌️</button>
         <button class="tbtn" id="tool-draw" onclick="setTool('draw')" title="Draw">✏️</button>
         <button class="tbtn" id="tool-text" onclick="setTool('text')" title="Text">T</button>
         <div class="tsep"></div>
@@ -237,6 +238,29 @@ input.pinput{width:100%;background:var(--surface2);border:1px solid var(--border
           Click to remove a background area, click again on another spot to remove more.<br>
           Hold <b>Alt</b> (or <b>Ctrl</b>) and click to bring back an area you removed by mistake.<br>
           Edges are auto-feathered to avoid a halo — raise Tolerance if bits of background remain, lower it if the subject gets eaten into.
+        </div>
+      </div>
+
+      <div class="psec">
+        <h4>🖌️ Brush Touch-up</h4>
+        <div class="tool-hint">For spots the wand can't get right — hair, chrome, shadows that match the background color. Draws directly, no color matching.</div>
+        <div style="display:flex;gap:5px;margin-bottom:6px">
+          <button class="btn btn-sm btn-secondary active" id="brushMode-erase" style="flex:1" onclick="setBrushMode('erase')">🧹 Erase</button>
+          <button class="btn btn-sm btn-secondary" id="brushMode-restore" style="flex:1" onclick="setBrushMode('restore')">↩ Restore</button>
+        </div>
+        <div class="srow">
+          <label>Size</label>
+          <input type="range" min="4" max="250" value="30" id="brushSize" oninput="document.getElementById('v-bsz').textContent=this.value">
+          <span class="sv" id="v-bsz">30</span>
+        </div>
+        <div class="srow">
+          <label>Softness</label>
+          <input type="range" min="0" max="100" value="40" id="brushSoftness" oninput="document.getElementById('v-bsf').textContent=this.value">
+          <span class="sv" id="v-bsf">40</span>
+        </div>
+        <div style="font-size:10px;color:var(--text3);line-height:1.5">
+          Select the 🖌️ tool, pick Erase or Restore, then click and drag over the image.<br>
+          Hold <b>Alt</b> (or <b>Ctrl</b>) while dragging to temporarily flip to the other mode.
         </div>
       </div>
 
@@ -412,9 +436,11 @@ input.pinput{width:100%;background:var(--surface2);border:1px solid var(--border
 // ===== STATE =====
 let files = [], currentIndex = -1;
 let originalData = null, bgRemovedData = null, hasBgRemoved = false;
+let origCanvasEl = null; // cached <canvas> copy of originalData, kept in sync — cheap drawImage source for the restore brush
 let editHistory = [];
 let currentTool = 'select', drawMode = 'pen';
 let isDrawing = false, lastX = 0, lastY = 0;
+let isBrushing = false, brushMode = 'erase', lastBrushX = 0, lastBrushY = 0;
 let pendingTextPlace = false;
 let bulkResults = [];
 let bgType = 'transparent', bgImageEl = null;
@@ -551,6 +577,7 @@ function loadImage(idx) {
     drawCanvas.width = img.width; drawCanvas.height = img.height;
     ctx.drawImage(img, 0, 0);
     originalData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    syncOrigCanvas();
     drawCtx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
     renderList();
   };
@@ -841,6 +868,7 @@ function rotateImage(deg) {
   drawCanvas.width = tc.width; drawCanvas.height = tc.height;
   ctx.drawImage(tc, 0, 0);
   originalData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  syncOrigCanvas();
 }
 
 function flipImage(dir) {
@@ -854,6 +882,17 @@ function flipImage(dir) {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.drawImage(tc, 0, 0);
   originalData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  syncOrigCanvas();
+}
+
+// Keeps a cached <canvas> mirror of originalData so the restore brush can drawImage() cheaply
+// instead of rebuilding a full ImageData (and re-running putImageData) on every brush stamp.
+function syncOrigCanvas() {
+  if (!originalData) { origCanvasEl = null; return; }
+  if (!origCanvasEl) origCanvasEl = document.createElement('canvas');
+  origCanvasEl.width = originalData.width;
+  origCanvasEl.height = originalData.height;
+  origCanvasEl.getContext('2d').putImageData(originalData, 0, 0);
 }
 
 // ===== TOOLS =====
@@ -862,9 +901,73 @@ function setTool(t) {
   document.querySelectorAll('.tbtn[id^="tool-"]').forEach(b => b.classList.remove('active'));
   const btn = document.getElementById('tool-' + t);
   if (btn) btn.classList.add('active');
-  const interactive = t === 'draw' || t === 'text' || t === 'wand';
+  const interactive = t === 'draw' || t === 'text' || t === 'wand' || t === 'brush';
   drawCanvas.style.pointerEvents = interactive ? 'auto' : 'none';
-  drawCanvas.style.cursor = t === 'wand' ? 'crosshair' : t === 'draw' ? 'crosshair' : t === 'text' ? 'text' : 'default';
+  drawCanvas.style.cursor = (t === 'wand' || t === 'draw' || t === 'brush') ? 'crosshair' : t === 'text' ? 'text' : 'default';
+}
+
+function setBrushMode(mode) {
+  brushMode = mode;
+  document.getElementById('brushMode-erase').classList.toggle('active', mode === 'erase');
+  document.getElementById('brushMode-restore').classList.toggle('active', mode === 'restore');
+}
+
+// ===== BRUSH TOUCH-UP (erase / restore) =====
+// Paints directly on raw pixels with no color matching — for spots the wand's flood fill can't
+// get right (hair strands, chrome/metal that shares the background's tone, soft shadows).
+function stampBrush(x, y, mode) {
+  const size = +document.getElementById('brushSize').value;
+  const softness = +document.getElementById('brushSoftness').value / 100; // 0=hard edge, 1=very soft
+  const r = size / 2;
+  const hardStop = Math.max(0, Math.min(0.95, 1 - softness));
+
+  if (mode === 'erase') {
+    ctx.save();
+    ctx.globalCompositeOperation = 'destination-out';
+    const grd = ctx.createRadialGradient(x, y, 0, x, y, r);
+    grd.addColorStop(0, 'rgba(0,0,0,1)');
+    grd.addColorStop(hardStop, 'rgba(0,0,0,1)');
+    grd.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = grd;
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  } else {
+    if (!origCanvasEl) return;
+    const left = Math.max(0, Math.floor(x - r)), top = Math.max(0, Math.floor(y - r));
+    const right = Math.min(canvas.width, Math.ceil(x + r)), bottom = Math.min(canvas.height, Math.ceil(y + r));
+    const bw = right - left, bh = bottom - top;
+    if (bw <= 0 || bh <= 0) return;
+    const tmp = document.createElement('canvas');
+    tmp.width = bw; tmp.height = bh;
+    const tctx = tmp.getContext('2d');
+    tctx.drawImage(origCanvasEl, left, top, bw, bh, 0, 0, bw, bh);
+    tctx.globalCompositeOperation = 'destination-in';
+    const grd = tctx.createRadialGradient(x - left, y - top, 0, x - left, y - top, r);
+    grd.addColorStop(0, 'rgba(0,0,0,1)');
+    grd.addColorStop(hardStop, 'rgba(0,0,0,1)');
+    grd.addColorStop(1, 'rgba(0,0,0,0)');
+    tctx.fillStyle = grd;
+    tctx.beginPath(); tctx.arc(x - left, y - top, r, 0, Math.PI * 2); tctx.fill();
+    ctx.drawImage(tmp, left, top);
+  }
+}
+
+// Interpolates stamps between the last point and this one so a fast drag doesn't leave gaps.
+function brushStrokeTo(x, y, mode) {
+  const dist = Math.hypot(x - lastBrushX, y - lastBrushY);
+  const step = Math.max(2, (+document.getElementById('brushSize').value) / 4);
+  const steps = Math.max(1, Math.floor(dist / step));
+  for (let i = 1; i <= steps; i++) {
+    const t = i / steps;
+    stampBrush(lastBrushX + (x - lastBrushX) * t, lastBrushY + (y - lastBrushY) * t, mode);
+  }
+  lastBrushX = x; lastBrushY = y;
+}
+
+function effectiveBrushMode(e) {
+  const flip = e.altKey || e.ctrlKey;
+  if (!flip) return brushMode;
+  return brushMode === 'erase' ? 'restore' : 'erase';
 }
 
 // Canvas click events
@@ -873,6 +976,17 @@ drawCanvas.addEventListener('mousedown', e => {
     const rect = drawCanvas.getBoundingClientRect();
     const mode = (e.altKey || e.ctrlKey) ? 'restore' : 'add';
     magicWandRemove(e.clientX - rect.left, e.clientY - rect.top, mode);
+    return;
+  }
+  if (currentTool === 'brush') {
+    saveHistory();
+    isBrushing = true;
+    const r = drawCanvas.getBoundingClientRect();
+    const sx = canvas.width / drawCanvas.offsetWidth;
+    const sy = canvas.height / drawCanvas.offsetHeight;
+    lastBrushX = (e.clientX - r.left) * sx;
+    lastBrushY = (e.clientY - r.top) * sy;
+    stampBrush(lastBrushX, lastBrushY, effectiveBrushMode(e));
     return;
   }
   if (currentTool === 'text') { placeTextAt(e); return; }
@@ -887,6 +1001,14 @@ drawCanvas.addEventListener('mousedown', e => {
 });
 
 drawCanvas.addEventListener('mousemove', e => {
+  if (isBrushing && currentTool === 'brush') {
+    const r = drawCanvas.getBoundingClientRect();
+    const sx = canvas.width / drawCanvas.offsetWidth;
+    const sy = canvas.height / drawCanvas.offsetHeight;
+    const x = (e.clientX - r.left) * sx, y = (e.clientY - r.top) * sy;
+    brushStrokeTo(x, y, effectiveBrushMode(e));
+    return;
+  }
   if (!isDrawing || drawMode !== 'pen') return;
   const r = drawCanvas.getBoundingClientRect();
   const sx = canvas.width / drawCanvas.offsetWidth;
@@ -900,6 +1022,12 @@ drawCanvas.addEventListener('mousemove', e => {
 });
 
 drawCanvas.addEventListener('mouseup', e => {
+  if (isBrushing) {
+    isBrushing = false;
+    bgRemovedData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    hasBgRemoved = true;
+    return;
+  }
   if (!isDrawing) return;
   isDrawing = false;
   if (drawMode !== 'pen') {
@@ -917,6 +1045,15 @@ drawCanvas.addEventListener('mouseup', e => {
     }
   }
   flattenDraw();
+});
+
+// Safety net: if the mouse is released outside the canvas mid-stroke, still end the brush stroke
+// (otherwise moving back over the canvas without the button held would keep painting).
+window.addEventListener('mouseup', () => {
+  if (isBrushing) {
+    isBrushing = false;
+    if (canvas.width) { bgRemovedData = ctx.getImageData(0, 0, canvas.width, canvas.height); hasBgRemoved = true; }
+  }
 });
 
 // Touch support
