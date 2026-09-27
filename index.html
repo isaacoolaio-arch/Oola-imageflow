@@ -204,6 +204,7 @@ input.pinput{width:100%;background:var(--surface2);border:1px solid var(--border
       <div class="editor-bar">
         <button class="tbtn active" id="tool-select" onclick="setTool('select')" title="Select">↖</button>
         <button class="tbtn" id="tool-wand" onclick="setTool('wand')" title="Magic Wand BG Remove">🪄</button>
+        <button class="tbtn" id="tool-lasso" onclick="setTool('lasso')" title="Lasso — draw around an area, then keep or remove it">🪢</button>
         <button class="tbtn" id="tool-brush" onclick="setTool('brush')" title="Brush erase/restore — for spots the wand can't handle">🖌️</button>
         <button class="tbtn" id="tool-draw" onclick="setTool('draw')" title="Draw">✏️</button>
         <button class="tbtn" id="tool-text" onclick="setTool('text')" title="Text">T</button>
@@ -261,6 +262,25 @@ input.pinput{width:100%;background:var(--surface2);border:1px solid var(--border
         <div style="font-size:10px;color:var(--text3);line-height:1.5">
           Select the 🖌️ tool, pick Erase or Restore, then click and drag over the image.<br>
           Hold <b>Alt</b> (or <b>Ctrl</b>) while dragging to temporarily flip to the other mode.
+        </div>
+      </div>
+
+      <div class="psec">
+        <h4>🪢 Lasso Select</h4>
+        <div class="tool-hint">For shapes tolerance and color-matching can't handle at all — draw the exact outline yourself.</div>
+        <div style="display:flex;gap:5px;margin-bottom:6px">
+          <button class="btn btn-sm btn-secondary active" id="lassoMode-keep" style="flex:1" onclick="setLassoMode('keep')">✂️ Keep Inside</button>
+          <button class="btn btn-sm btn-secondary" id="lassoMode-remove" style="flex:1" onclick="setLassoMode('remove')">🗑️ Remove Inside</button>
+        </div>
+        <div class="srow">
+          <label>Feather</label>
+          <input type="range" min="0" max="20" value="2" id="lassoFeather" oninput="document.getElementById('v-lft').textContent=this.value">
+          <span class="sv" id="v-lft">2</span>
+        </div>
+        <div style="font-size:10px;color:var(--text3);line-height:1.5">
+          Select the 🪢 tool, then click-drag a loop around the area — it closes and applies the moment you release.<br>
+          <b>Keep Inside</b>: everything outside the loop is removed (trace around your subject, like the red outline).<br>
+          <b>Remove Inside</b>: only what's inside the loop is removed (circle an unwanted patch of background).
         </div>
       </div>
 
@@ -441,6 +461,7 @@ let editHistory = [];
 let currentTool = 'select', drawMode = 'pen';
 let isDrawing = false, lastX = 0, lastY = 0;
 let isBrushing = false, brushMode = 'erase', lastBrushX = 0, lastBrushY = 0;
+let isLassoing = false, lassoMode = 'keep', lassoPoints = [];
 let pendingTextPlace = false;
 let bulkResults = [];
 let bgType = 'transparent', bgImageEl = null;
@@ -901,15 +922,21 @@ function setTool(t) {
   document.querySelectorAll('.tbtn[id^="tool-"]').forEach(b => b.classList.remove('active'));
   const btn = document.getElementById('tool-' + t);
   if (btn) btn.classList.add('active');
-  const interactive = t === 'draw' || t === 'text' || t === 'wand' || t === 'brush';
+  const interactive = t === 'draw' || t === 'text' || t === 'wand' || t === 'brush' || t === 'lasso';
   drawCanvas.style.pointerEvents = interactive ? 'auto' : 'none';
-  drawCanvas.style.cursor = (t === 'wand' || t === 'draw' || t === 'brush') ? 'crosshair' : t === 'text' ? 'text' : 'default';
+  drawCanvas.style.cursor = (t === 'wand' || t === 'draw' || t === 'brush' || t === 'lasso') ? 'crosshair' : t === 'text' ? 'text' : 'default';
 }
 
 function setBrushMode(mode) {
   brushMode = mode;
   document.getElementById('brushMode-erase').classList.toggle('active', mode === 'erase');
   document.getElementById('brushMode-restore').classList.toggle('active', mode === 'restore');
+}
+
+function setLassoMode(mode) {
+  lassoMode = mode;
+  document.getElementById('lassoMode-keep').classList.toggle('active', mode === 'keep');
+  document.getElementById('lassoMode-remove').classList.toggle('active', mode === 'remove');
 }
 
 // ===== BRUSH TOUCH-UP (erase / restore) =====
@@ -970,12 +997,75 @@ function effectiveBrushMode(e) {
   return brushMode === 'erase' ? 'restore' : 'erase';
 }
 
+// ===== LASSO SELECT (keep inside / remove inside) =====
+// For outlines the wand's color logic and the brush's manual painting are both too slow or too
+// imprecise for — draw the exact shape once and apply it as a mask in a single step.
+function drawLassoPreview() {
+  drawCtx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
+  if (lassoPoints.length < 2) return;
+  drawCtx.save();
+  drawCtx.lineWidth = 2;
+  drawCtx.strokeStyle = '#7c6af7';
+  drawCtx.setLineDash([]);
+  drawCtx.beginPath();
+  drawCtx.moveTo(lassoPoints[0].x, lassoPoints[0].y);
+  for (let i = 1; i < lassoPoints.length; i++) drawCtx.lineTo(lassoPoints[i].x, lassoPoints[i].y);
+  drawCtx.stroke();
+  // Dashed preview of the closing segment so it's clear the loop auto-closes on release.
+  drawCtx.setLineDash([6, 6]);
+  drawCtx.strokeStyle = 'rgba(124,106,247,0.6)';
+  drawCtx.beginPath();
+  drawCtx.moveTo(lassoPoints[lassoPoints.length - 1].x, lassoPoints[lassoPoints.length - 1].y);
+  drawCtx.lineTo(lassoPoints[0].x, lassoPoints[0].y);
+  drawCtx.stroke();
+  drawCtx.restore();
+}
+
+function applyLassoSelection(mode) {
+  if (!canvas.width || lassoPoints.length < 3) return;
+  saveHistory();
+  const w = canvas.width, h = canvas.height;
+  const feather = +document.getElementById('lassoFeather').value;
+
+  const maskC = document.createElement('canvas');
+  maskC.width = w; maskC.height = h;
+  const mctx = maskC.getContext('2d');
+  if (feather > 0) mctx.filter = `blur(${feather}px)`;
+  mctx.fillStyle = '#fff';
+  mctx.beginPath();
+  mctx.moveTo(lassoPoints[0].x, lassoPoints[0].y);
+  for (let i = 1; i < lassoPoints.length; i++) mctx.lineTo(lassoPoints[i].x, lassoPoints[i].y);
+  mctx.closePath();
+  mctx.fill();
+
+  const tmp = document.createElement('canvas');
+  tmp.width = w; tmp.height = h;
+  const tctx = tmp.getContext('2d');
+  tctx.drawImage(canvas, 0, 0);
+  tctx.globalCompositeOperation = mode === 'keep' ? 'destination-in' : 'destination-out';
+  tctx.drawImage(maskC, 0, 0);
+
+  ctx.clearRect(0, 0, w, h);
+  ctx.drawImage(tmp, 0, 0);
+  bgRemovedData = ctx.getImageData(0, 0, w, h);
+  hasBgRemoved = true;
+}
+
 // Canvas click events
 drawCanvas.addEventListener('mousedown', e => {
   if (currentTool === 'wand') {
     const rect = drawCanvas.getBoundingClientRect();
     const mode = (e.altKey || e.ctrlKey) ? 'restore' : 'add';
     magicWandRemove(e.clientX - rect.left, e.clientY - rect.top, mode);
+    return;
+  }
+  if (currentTool === 'lasso') {
+    isLassoing = true;
+    const r = drawCanvas.getBoundingClientRect();
+    const sx = canvas.width / drawCanvas.offsetWidth;
+    const sy = canvas.height / drawCanvas.offsetHeight;
+    lassoPoints = [{ x: (e.clientX - r.left) * sx, y: (e.clientY - r.top) * sy }];
+    drawCtx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
     return;
   }
   if (currentTool === 'brush') {
@@ -1001,6 +1091,14 @@ drawCanvas.addEventListener('mousedown', e => {
 });
 
 drawCanvas.addEventListener('mousemove', e => {
+  if (isLassoing && currentTool === 'lasso') {
+    const r = drawCanvas.getBoundingClientRect();
+    const sx = canvas.width / drawCanvas.offsetWidth;
+    const sy = canvas.height / drawCanvas.offsetHeight;
+    lassoPoints.push({ x: (e.clientX - r.left) * sx, y: (e.clientY - r.top) * sy });
+    drawLassoPreview();
+    return;
+  }
   if (isBrushing && currentTool === 'brush') {
     const r = drawCanvas.getBoundingClientRect();
     const sx = canvas.width / drawCanvas.offsetWidth;
@@ -1022,6 +1120,13 @@ drawCanvas.addEventListener('mousemove', e => {
 });
 
 drawCanvas.addEventListener('mouseup', e => {
+  if (isLassoing) {
+    isLassoing = false;
+    drawCtx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
+    if (lassoPoints.length > 4) applyLassoSelection(lassoMode);
+    lassoPoints = [];
+    return;
+  }
   if (isBrushing) {
     isBrushing = false;
     bgRemovedData = ctx.getImageData(0, 0, canvas.width, canvas.height);
@@ -1053,6 +1158,12 @@ window.addEventListener('mouseup', () => {
   if (isBrushing) {
     isBrushing = false;
     if (canvas.width) { bgRemovedData = ctx.getImageData(0, 0, canvas.width, canvas.height); hasBgRemoved = true; }
+  }
+  if (isLassoing) {
+    isLassoing = false;
+    drawCtx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
+    if (lassoPoints.length > 4) applyLassoSelection(lassoMode);
+    lassoPoints = [];
   }
 });
 
